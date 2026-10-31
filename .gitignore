@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+bin/
+build/
+.dart_tool/
+.flutter-plugins*
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+node_modules/
+coverage/
+*.log

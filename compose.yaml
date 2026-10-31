@@ -1,0 +1,64 @@
+# Local development stack. NOT a production deployment descriptor.
+# NOTE: not executed in the authoring sandbox (no Docker); see docs/operations/known-limitations.md.
+# Postgres and Redis publish no host ports: only containers on this network can reach them.
+name: sarathi
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set in .env}"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD} ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+  migrate:
+    build: { context: ., dockerfile: infra/docker/api.Dockerfile }
+    command: ["migrate"]
+    environment: &api-env
+      SARATHI_ENV: ${SARATHI_ENV:-local}
+      SARATHI_DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      SARATHI_REDIS_ADDR: redis:6379
+      SARATHI_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SARATHI_LOG_LEVEL: ${SARATHI_LOG_LEVEL:-info}
+      SARATHI_CORS_ALLOWED_ORIGINS: ${SARATHI_CORS_ALLOWED_ORIGINS:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    build: { context: ., dockerfile: infra/docker/api.Dockerfile }
+    environment: *api-env
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  ai:
+    build: { context: ., dockerfile: infra/docker/ai.Dockerfile }
+    environment:
+      SARATHI_AI_ENV: ${SARATHI_ENV:-local}
+      SARATHI_AI_SERVICE_TOKEN: ${SARATHI_AI_SERVICE_TOKEN:?set in .env}
+    ports:
+      - "127.0.0.1:8090:8090"
+
+volumes:
+  pgdata:

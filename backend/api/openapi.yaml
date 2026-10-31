@@ -1,0 +1,45 @@
+openapi: 3.0.3
+info:
+  title: SARATHI API
+  version: 0.1.0
+  description: >
+    Milestone 1 surface only. Endpoints listed here exist and are tested.
+    Further groups (auth, trips, QR, quota, payments, gateway, admin) are added as implemented.
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Liveness (does not check dependencies)
+      responses:
+        "200": { description: Process is serving, content: { application/json: { schema: { $ref: "#/components/schemas/StatusEnvelope" } } } }
+  /readyz:
+    get:
+      summary: Readiness (PostgreSQL and Redis)
+      responses:
+        "200": { description: All dependencies reachable }
+        "503": { description: At least one dependency unavailable }
+  /api/v1/version:
+    get:
+      summary: Build version and environment
+      responses:
+        "200": { description: OK }
+components:
+  schemas:
+    StatusEnvelope:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            status: { type: string }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            request_id: { type: string }
