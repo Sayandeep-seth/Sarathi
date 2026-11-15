@@ -1,5 +1,4 @@
 # syntax=docker/dockerfile:1
-# NOTE: not built in the authoring sandbox (no Docker). Verify with `make docker-build`.
 FROM python:3.12-slim AS build
 WORKDIR /w
 COPY ai/requirements.txt .

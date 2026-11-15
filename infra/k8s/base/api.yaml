@@ -1,0 +1,124 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sarathi-api
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sarathi-api
+  labels: { app.kubernetes.io/name: sarathi-api, app.kubernetes.io/part-of: sarathi }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels: { app.kubernetes.io/name: sarathi-api }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: sarathi-api, app.kubernetes.io/part-of: sarathi }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: sarathi-api
+      automountServiceAccountToken: false
+      # Readiness is removed first, then the pod sleeps so load balancers stop sending
+      # traffic before SIGTERM; the API then drains for up to SARATHI_SHUTDOWN_TIMEOUT.
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: sarathi-api }
+      initContainers:
+        # Migrations take a PostgreSQL advisory lock, so parallel pods are safe.
+        - name: migrate
+          image: sarathi/api
+          args: ["migrate"]
+          envFrom: &env
+            - configMapRef: { name: sarathi-config }
+            - secretRef: { name: sarathi-secrets }
+          securityContext: &hardened
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { memory: 128Mi }
+      containers:
+        - name: api
+          image: sarathi/api
+          envFrom: *env
+          ports:
+            - { name: http, containerPort: 8080 }
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 4
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              sleep: { seconds: 8 } # distroless has no shell; needs Kubernetes 1.30+
+          securityContext: *hardened
+          resources:
+            requests: { cpu: 100m, memory: 96Mi }
+            limits: { memory: 384Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sarathi-api
+  labels: { app.kubernetes.io/name: sarathi-api }
+spec:
+  selector: { app.kubernetes.io/name: sarathi-api }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sarathi-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: sarathi-api }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sarathi-api
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: sarathi-api }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+  behavior:
+    # WebSocket clients reconnect when a pod goes away: scale down slowly.
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - { type: Pods, value: 1, periodSeconds: 120 }

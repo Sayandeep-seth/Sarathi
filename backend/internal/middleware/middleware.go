@@ -3,10 +3,12 @@
 package middleware
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
 	"runtime/debug"
@@ -61,6 +63,18 @@ type statusWriter struct {
 func (s *statusWriter) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
+}
+
+// Status returns the response status written so far (200 if none was set).
+func (s *statusWriter) Status() int { return s.status }
+
+// Unwrap lets http.ResponseController reach Hijack/Flush on the underlying writer,
+// which WebSocket upgrades need.
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+// Hijack implements http.Hijacker for WebSocket upgrades.
+func (s *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(s.ResponseWriter).Hijack()
 }
 
 // Logging emits one structured log line per request. It never logs headers, query

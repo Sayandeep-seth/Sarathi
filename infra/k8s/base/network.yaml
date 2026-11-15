@@ -1,0 +1,85 @@
+# Public entry point. Only "/" and "/api" are routed: /internal (gateway) and /metrics
+# are never reachable from the internet through this Ingress.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sarathi
+  annotations:
+    # WebSockets stay open for as long as the app is on screen.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: 1m
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service: { name: sarathi-api, port: { name: http } }
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: sarathi-web, port: { name: http } }
+---
+# Default deny: every pod in the namespace accepts only what is allowed below.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-api
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: sarathi-api }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        # The API trusts X-Real-IP (SARATHI_TRUST_PROXY), so only proxies that set it
+        # themselves may connect: the ingress controller and the web tier.
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: sarathi-web }
+        # Prometheus scrapes /metrics from the monitoring namespace.
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { port: 8080, protocol: TCP }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-web
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: sarathi-web }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+      ports:
+        - { port: 8080, protocol: TCP }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-to-ai
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: sarathi-ai }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: sarathi-api }
+      ports:
+        - { port: 8090, protocol: TCP }

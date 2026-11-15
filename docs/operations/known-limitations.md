@@ -1,25 +1,71 @@
-# Known limitations and unverified items (Milestone 1)
+# Known limitations
 
-## Verified locally
-1. **Flutter passenger prototype** (`apps/passenger_app`): `flutter analyze` and widget tests cover demo phone sign-in, route planning, bookings, commute, shopping, Wi-Fi, and narrow layouts. No Android/iOS device build has been verified; platform folders are not generated. Run `flutter create` as shown in the README.
+This is the honest gap list between the repository and a public launch. Nothing here
+is hidden behind a flag: if it is listed, it does not exist yet.
 
-## Unverified — written but never run
-1. **Docker** (`infra/docker/*`, `compose.yaml`) and **GitHub Actions** (`.github/workflows/ci.yml`): never executed. Expect to fix small issues on first run.
+## Blocking a real launch
 
-## Environment-driven deviations
-3. **`go.mod` replace directives**: the sandbox could not reach `proxy.golang.org`, `golang.org` or `gopkg.in`, so indirect modules are resolved from GitHub mirrors. `go.sum` reflects that. On a normal network, delete the `replace` block and run `go mod tidy`.
-4. **Race detector not run**: the Go toolchain used had no cgo, so `go test -race` could not execute locally. CI runs it; that result is unknown.
-5. Go was installed from conda-forge (1.27.3) rather than go.dev.
+1. **No payment provider.** `SARATHI_PAYMENT_PROVIDER` accepts only `mock` (rejected in
+   production) and `none`. In production Wi-Fi plans cannot be bought and trip fares are
+   recorded but never collected. Integrating a provider means: order creation, signed
+   webhook verification, idempotent settlement into `payments`, refunds and reconciliation.
+2. **No SMS provider.** Outside local mode OTPs are POSTed to `SARATHI_OTP_WEBHOOK_URL`
+   as `{"to","message"}` with a bearer token. You must run or adapt an endpoint for your
+   provider (and complete DLT template registration for India).
+3. **The map is not real.** `backend/internal/geo` is an 11×11 grid with stylised place
+   positions. Distances, ETAs and fares are consistent with that grid, not with real
+   roads. A real launch needs a routing engine and real geocoding.
+4. **No driver app and no vehicle gateway.** The driver endpoints (availability,
+   location, start with boarding code, complete) and the gateway usage endpoint are
+   implemented and tested, but nothing except the simulator and the smoke test calls
+   them. Wi-Fi is not actually enforced on any network.
+5. **Gateway authentication is one shared token** for all gateways. Per-vehicle
+   credentials (mTLS or signed reports) are required before trusting real meters.
+6. **No legal or privacy review** (DPDP Act, telecom and payment obligations), no terms
+   or privacy policy, no data-retention or deletion workflow beyond MongoDB TTLs.
 
-## Not implemented yet (by design, scheduled)
-Production authentication/OTP, users, cabs, dispatch, trip persistence, fare calculation, payment processing, public-transit validation, Wi-Fi sessions, quota ledger, gateway protocol and agent, admin dashboard, driver app, AI analytics logic, monitoring stack, backup/restore scripts, runbooks, OpenAPI coverage beyond Milestone 1 endpoints, load tests.
+## Verified, and how
 
-The passenger app's phone sign-in is a local-only UI demo. It accepts a public fixed test code (`123456`); no SMS is sent, no phone is verified, no account is created, and no credentials or session are persisted or sent to the API. Do not use it to authenticate real users. Production launch requires a backend identity service, an SMS/OTP provider, secure session storage and expiry/refresh, abuse protections, and published legal/privacy documents.
+| Area | Evidence |
+|---|---|
+| Go API | `go vet`, `go test -race` (unit + PostgreSQL-backed store and migration tests), `govulncheck`: 0 reachable vulnerabilities |
+| Whole stack | `docker compose up --wait`, then `scripts/smoke.mjs`: 50 checks covering OTP, token rotation and reuse detection, authorization, booking race, idempotency, WebSocket, a simulated trip to completion, ledger arithmetic and MongoDB timelines |
+| Web app | Type-check, build, unit tests, and a scripted headless-browser run (sign in, plan, book, ride) with no console errors beyond the expected first-visit 401 |
+| Kubernetes manifests | Both overlays render with `kubectl kustomize` and pass `kubeconform -strict` for Kubernetes 1.31 |
 
-The passenger prototype displays sample routes, estimated vehicle dimensions, station visits/ratings, fares, tour and event inventory, ride rewards, and Wi-Fi usage. These are not live routing, GPS observations, verified vehicle fit advice, partner inventory, or real prices. Its QR is a demo payload and is not a ticket or valid boarding credential. No actual payment, trip, data top-up, or seat reservation is created. Production use requires authoritative data sources, safety validation, operator/fleet agreements, privacy review, and backend integrations.
+## Not verified
 
-## Hardening items already known
-* Migration checksum verification of applied files is not enforced.
-* Redis probe is a minimal RESP client for health checks only.
-* No rate limiting, authentication or TLS termination yet (no sensitive endpoints exist yet).
-* No legal/privacy review has been performed (DPDP Act, payment-provider obligations). Nothing here claims compliance.
+* **Kubernetes manifests have never been applied to a cluster.** Expect to adjust for
+  your ingress controller, storage class and CNI (NetworkPolicy enforcement needs one
+  that supports it). The `preStop.sleep` hook needs Kubernetes 1.30+.
+* **Multiple API replicas** have not been exercised together. Cross-replica WebSocket
+  fan-out (Redis pub/sub) and the simulator leader lease are implemented but untested
+  beyond a single replica.
+* **GitHub Actions** workflow has not run on a runner.
+* **No load or soak testing.** Limits such as 20 000 WebSocket connections per replica
+  and the rate-limit thresholds are reasoned defaults, not measured.
+* **Browsers**: only Chromium (Edge) was exercised. Safari and Firefox are untested.
+* The Flutter prototype and the AI service were not changed or re-run in this round.
+
+## Design trade-offs to know about
+
+* **WebSocket events are not replayed.** Clients resync over HTTP after every
+  reconnect; a client that never reconnects could show stale state.
+* **Role changes take up to 15 minutes** (the access-token lifetime) to take effect,
+  because roles are read from the token.
+* **Rate limits are fixed windows** in Redis and fail open for general traffic when
+  Redis is unreachable (they fail closed for OTP, purchases and boarding codes).
+* **One secret, three uses**: `SARATHI_JWT_SECRET` signs access tokens and keys the OTP
+  and boarding-code HMACs. Rotating it signs everyone out and changes pending boarding
+  codes. There is no key-rotation overlap window.
+* **Telemetry is lossy by design**: MongoDB writes are buffered (4096 records) and
+  dropped under back-pressure rather than slowing trips.
+* **Live cab positions are visible to every signed-in user**, including cabs carrying
+  other passengers. Acceptable for a demo fleet; revisit for real riders.
+* **Compose and the in-cluster datastores are single-node with no backups.** Use
+  managed PostgreSQL/Redis/MongoDB with backups and TLS for anything that matters.
+* **Migrations** are forward-only and checksum verification of applied files is not
+  enforced. Never edit an applied migration.
+* **No tracing or alerting.** Prometheus metrics (`/metrics`) and structured JSON logs
+  exist; dashboards, alerts and runbooks do not.
+* **No admin UI.** Admin and driver functions are API-only.

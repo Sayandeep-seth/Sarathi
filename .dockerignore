@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+**/node_modules
+**/dist
+**/.venv
+**/__pycache__
+**/.dart_tool
+apps
+docs

@@ -1,10 +1,21 @@
-# Local development stack. NOT a production deployment descriptor.
-# NOTE: not executed in the authoring sandbox (no Docker); see docs/operations/known-limitations.md.
-# Postgres and Redis publish no host ports: only containers on this network can reach them.
+# Single-host stack: PostgreSQL, Redis, MongoDB, API, AI service and the web app.
+# Suitable for development and demos. For production use infra/k8s (or managed
+# databases); this file keeps data in local Docker volumes with no backups.
+# Only the web app (3000) and the API (8080) are published, both on loopback;
+# change the host ports with SARATHI_WEB_PORT / SARATHI_API_PORT if they are taken.
 name: sarathi
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
 
 services:
   postgres:
+    <<: *restart
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?set in .env}
@@ -19,46 +30,105 @@ services:
       retries: 10
 
   redis:
+    <<: *restart
     image: redis:7-alpine
-    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set in .env}"]
+    # Redis holds only short-lived state (OTP, rate limits, live positions). AOF keeps
+    # rate-limit windows across restarts; noeviction never silently drops an OTP.
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set in .env}
+    volumes:
+      - redisdata:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD} ping | grep PONG"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+  mongo:
+    <<: *restart
+    image: mongo:7
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:?set in .env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:?set in .env}
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand({ping:1}).ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
   migrate:
     build: { context: ., dockerfile: infra/docker/api.Dockerfile }
+    image: sarathi/api:local
     command: ["migrate"]
+    <<: *hardening
     environment: &api-env
       SARATHI_ENV: ${SARATHI_ENV:-local}
       SARATHI_DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
       SARATHI_REDIS_ADDR: redis:6379
       SARATHI_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SARATHI_MONGO_URL: mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongo:27017/?authSource=admin
+      SARATHI_MONGO_DATABASE: sarathi
+      SARATHI_JWT_SECRET: ${SARATHI_JWT_SECRET:?set in .env}
+      SARATHI_GATEWAY_TOKEN: ${SARATHI_GATEWAY_TOKEN:?set in .env}
+      SARATHI_ADMIN_PHONES: ${SARATHI_ADMIN_PHONES:-}
+      SARATHI_OTP_SENDER: ${SARATHI_OTP_SENDER:-}
+      SARATHI_OTP_WEBHOOK_URL: ${SARATHI_OTP_WEBHOOK_URL:-}
+      SARATHI_OTP_WEBHOOK_TOKEN: ${SARATHI_OTP_WEBHOOK_TOKEN:-}
+      SARATHI_PAYMENT_PROVIDER: ${SARATHI_PAYMENT_PROVIDER:-}
+      SARATHI_SIMULATOR: ${SARATHI_SIMULATOR:-}
+      SARATHI_SIMULATOR_CABS: ${SARATHI_SIMULATOR_CABS:-}
+      SARATHI_SIMULATOR_RATE: ${SARATHI_SIMULATOR_RATE:-}
       SARATHI_LOG_LEVEL: ${SARATHI_LOG_LEVEL:-info}
       SARATHI_CORS_ALLOWED_ORIGINS: ${SARATHI_CORS_ALLOWED_ORIGINS:-}
+      # Browsers reach the API only through the web container, which sets X-Real-IP.
+      SARATHI_TRUST_PROXY: "true"
     depends_on:
       postgres: { condition: service_healthy }
     restart: "no"
 
   api:
-    build: { context: ., dockerfile: infra/docker/api.Dockerfile }
+    <<: [*restart, *hardening]
+    image: sarathi/api:local
     environment: *api-env
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${SARATHI_API_PORT:-8080}:8080"
     depends_on:
       migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
+      mongo: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "/api", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    stop_grace_period: 25s
 
   ai:
+    <<: [*restart, *hardening]
     build: { context: ., dockerfile: infra/docker/ai.Dockerfile }
+    image: sarathi/ai:local
     environment:
       SARATHI_AI_ENV: ${SARATHI_ENV:-local}
       SARATHI_AI_SERVICE_TOKEN: ${SARATHI_AI_SERVICE_TOKEN:?set in .env}
+    tmpfs: [/tmp]
+
+  web:
+    <<: [*restart, *hardening]
+    build: { context: ., dockerfile: infra/docker/web.Dockerfile }
+    image: sarathi/web:local
+    environment:
+      API_UPSTREAM: api:8080
     ports:
-      - "127.0.0.1:8090:8090"
+      - "127.0.0.1:${SARATHI_WEB_PORT:-3000}:8080"
+    tmpfs: ["/tmp:uid=101,gid=101", "/etc/nginx/conf.d:uid=101,gid=101"]
+    depends_on:
+      api: { condition: service_healthy }
 
 volumes:
   pgdata:
+  redisdata:
+  mongodata:

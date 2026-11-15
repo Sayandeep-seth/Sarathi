@@ -1,38 +1,348 @@
 openapi: 3.0.3
 info:
   title: SARATHI API
-  version: 0.1.0
+  version: 1.0.0
   description: >
-    Milestone 1 surface only. Endpoints listed here exist and are tested.
-    Further groups (auth, trips, QR, quota, payments, gateway, admin) are added as implemented.
+    Every endpoint listed here is implemented. Success responses are wrapped as
+    {"data": ...}; errors as {"error": {"code", "message", "request_id"}}.
+    Money is integer paise; quota is integer bytes; timestamps are RFC 3339 UTC.
+    All product endpoints are rate limited (429 with Retry-After).
 servers:
-  - url: http://localhost:8080
+  - url: http://localhost:3000
+    description: Local stack through the web proxy
+tags:
+  - { name: system }
+  - { name: auth }
+  - { name: rider }
+  - { name: wifi }
+  - { name: driver }
+  - { name: admin }
+  - { name: gateway }
+security:
+  - bearer: []
 paths:
   /healthz:
     get:
-      summary: Liveness (does not check dependencies)
-      responses:
-        "200": { description: Process is serving, content: { application/json: { schema: { $ref: "#/components/schemas/StatusEnvelope" } } } }
+      tags: [system]
+      security: []
+      summary: Liveness (no dependency checks)
+      responses: { "200": { description: Process is serving } }
   /readyz:
     get:
-      summary: Readiness (PostgreSQL and Redis)
+      tags: [system]
+      security: []
+      summary: Readiness. PostgreSQL and Redis are required; MongoDB is advisory ("degraded" does not fail it).
       responses:
-        "200": { description: All dependencies reachable }
-        "503": { description: At least one dependency unavailable }
+        "200": { description: Ready }
+        "503": { description: A required dependency is unavailable }
+  /metrics:
+    get:
+      tags: [system]
+      security: []
+      summary: Prometheus metrics. Not routed by the web tier or the Ingress.
+      responses: { "200": { description: Text exposition format } }
   /api/v1/version:
     get:
-      summary: Build version and environment
+      tags: [system]
+      security: []
+      responses: { "200": { description: Build version and environment } }
+  /api/v1/city:
+    get:
+      tags: [system]
+      security: []
+      summary: Service-area grid and bookable places
+      responses: { "200": { description: OK } }
+
+  /api/v1/auth/otp/request:
+    post:
+      tags: [auth]
+      security: []
+      summary: Send a 6-digit code (valid 5 minutes, 5 attempts). Limited to 3 per phone per 10 minutes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              additionalProperties: false
+              properties:
+                phone: { type: string, pattern: '^\+[1-9][0-9]{7,14}$', example: "+919876543210" }
+      responses:
+        "200": { description: 'Sent. "dev_code" is included only when SARATHI_ENV=local with the log sender.' }
+        "400": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /api/v1/auth/otp/verify:
+    post:
+      tags: [auth]
+      security: []
+      summary: Exchange a code for a session. Creates the account on first sign-in.
+      description: >
+        Browsers receive the refresh token as an HttpOnly, SameSite=Strict cookie scoped
+        to /api/v1/auth. Clients sending "client":"mobile" receive it in the body instead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code]
+              additionalProperties: false
+              properties:
+                phone: { type: string }
+                code: { type: string, minLength: 6, maxLength: 6 }
+                name: { type: string, maxLength: 80 }
+                client: { type: string, enum: [mobile] }
+      responses:
+        "200": { description: Session, content: { application/json: { schema: { $ref: "#/components/schemas/SessionEnvelope" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      security: []
+      summary: Rotate the refresh token (cookie, or {"refresh_token"} for mobile). Reuse of a rotated token revokes all sessions.
+      responses:
+        "200": { description: New session }
+        "401": { $ref: "#/components/responses/Error" }
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      security: []
+      summary: Revoke the presented refresh token and clear the cookie
+      responses: { "200": { description: Signed out } }
+  /api/v1/me:
+    get:
+      tags: [auth]
+      responses: { "200": { description: Current user } }
+    patch:
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name], additionalProperties: false, properties: { name: { type: string, minLength: 1, maxLength: 80 } } }
+      responses: { "200": { description: Updated user } }
+
+  /api/v1/cabs:
+    get:
+      tags: [rider]
+      summary: Online cabs with their latest positions
+      responses: { "200": { description: OK } }
+  /api/v1/trips/estimate:
+    post:
+      tags: [rider]
+      requestBody: { $ref: "#/components/requestBodies/Places" }
+      responses:
+        "200": { description: 'distance_m, duration_s, fare_paise' }
+        "400": { $ref: "#/components/responses/Error" }
+  /api/v1/trips:
+    get:
+      tags: [rider]
+      summary: The caller's 50 most recent trips
+      responses: { "200": { description: OK } }
+    post:
+      tags: [rider]
+      summary: Book a trip. The nearest available cab is assigned atomically.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema: { type: string, pattern: '^[A-Za-z0-9._:-]{8,64}$' }
+          description: A repeated key returns the original trip with 200.
+      requestBody: { $ref: "#/components/requestBodies/Places" }
+      responses:
+        "201": { description: Trip assigned, content: { application/json: { schema: { $ref: "#/components/schemas/TripEnvelope" } } } }
+        "200": { description: Idempotent replay }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { description: 'active_trip_exists', content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: 'no_cabs_available', content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /api/v1/trips/{id}:
+    get:
+      tags: [rider]
+      summary: Visible to the passenger (with boarding_code), the assigned driver and admins; 404 otherwise
+      parameters: [{ $ref: "#/components/parameters/id" }]
       responses:
         "200": { description: OK }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/trips/{id}/timeline:
+    get:
+      tags: [rider]
+      summary: Status events and recorded cab path (MongoDB). "available" is false when MongoDB is not configured.
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK } }
+  /api/v1/trips/{id}/cancel:
+    post:
+      tags: [rider]
+      summary: Passenger cancels a trip that has not started
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: Cancelled; the cab is released }
+        "409": { $ref: "#/components/responses/Error" }
+  /api/v1/ws/ticket:
+    post:
+      tags: [rider]
+      summary: Single-use ticket (30 s) for one WebSocket connection
+      responses: { "200": { description: '{"ticket","expires_in"}' } }
+  /api/v1/ws:
+    get:
+      tags: [rider]
+      security: []
+      summary: WebSocket (server push only)
+      description: >
+        Connect with ?ticket=. Messages are JSON: {"type":"hello"}, {"type":"fleet","cabs":[...]},
+        {"type":"trip","trip":{...}}, {"type":"quota","remaining_bytes":n} and, for drivers,
+        {"type":"driver_trip","trip":{...}}. Missed events are not replayed: refetch state after reconnecting.
+      parameters:
+        - { in: query, name: ticket, required: true, schema: { type: string } }
+      responses:
+        "101": { description: Switching protocols }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/wifi/plans:
+    get:
+      tags: [wifi]
+      responses: { "200": { description: 'plans[], purchases_enabled' } }
+  /api/v1/wifi/quota:
+    get:
+      tags: [wifi]
+      responses: { "200": { description: 'remaining_bytes and the 20 latest ledger entries' } }
+  /api/v1/wifi/purchase:
+    post:
+      tags: [wifi]
+      summary: Buy a plan. Only the non-production mock provider exists; otherwise 501 payments_disabled.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [plan_id], additionalProperties: false, properties: { plan_id: { type: string } } }
+      responses:
+        "201": { description: Quota credited }
+        "404": { $ref: "#/components/responses/Error" }
+        "501": { $ref: "#/components/responses/Error" }
+
+  /api/v1/driver/cab:
+    get:
+      tags: [driver]
+      summary: The driver's cab and its active trip (role driver or admin)
+      responses: { "200": { description: OK }, "404": { $ref: "#/components/responses/Error" } }
+  /api/v1/driver/availability:
+    post:
+      tags: [driver]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [available], additionalProperties: false, properties: { available: { type: boolean } } }
+      responses: { "200": { description: OK }, "409": { $ref: "#/components/responses/Error" } }
+  /api/v1/driver/location:
+    post:
+      tags: [driver]
+      summary: Report position (must be inside the service area)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lat, lng]
+              additionalProperties: false
+              properties:
+                lat: { type: number }
+                lng: { type: number }
+                heading: { type: number, minimum: 0, exclusiveMaximum: true, maximum: 360 }
+      responses: { "200": { description: Recorded } }
+  /api/v1/driver/trips/{id}/start:
+    post:
+      tags: [driver]
+      summary: Start the trip by presenting the passenger's boarding code (5 attempts per trip per 10 minutes)
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [boarding_code], additionalProperties: false, properties: { boarding_code: { type: string } } }
+      responses:
+        "200": { description: Trip in progress }
+        "403": { $ref: "#/components/responses/Error" }
+  /api/v1/driver/trips/{id}/complete:
+    post:
+      tags: [driver]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: Trip completed; cab released } }
+
+  /api/v1/admin/stats:
+    get:
+      tags: [admin]
+      responses: { "200": { description: Fleet and trip counters } }
+  /api/v1/admin/cabs:
+    post:
+      tags: [admin]
+      summary: Register a cab and promote the phone's account to driver
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plate, model, seats, driver_phone]
+              additionalProperties: false
+              properties:
+                plate: { type: string }
+                model: { type: string }
+                seats: { type: integer, minimum: 1, maximum: 12 }
+                electric: { type: boolean }
+                driver_name: { type: string }
+                driver_phone: { type: string }
+      responses:
+        "201": { description: Cab created }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /internal/v1/gateway/usage:
+    post:
+      tags: [gateway]
+      security: [{ gateway: [] }]
+      summary: Metered usage for an in-progress trip. Idempotent by report_id; the debit is clamped to the remaining quota.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [report_id, trip_id, bytes]
+              additionalProperties: false
+              properties:
+                report_id: { type: string, pattern: '^[A-Za-z0-9._:-]{8,64}$' }
+                trip_id: { type: string, format: uuid }
+                bytes: { type: integer, format: int64, minimum: 1, maximum: 4294967296 }
+      responses:
+        "200": { description: 'debited_bytes, remaining_bytes, allow' }
+        "401": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
 components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+    gateway: { type: apiKey, in: header, name: X-Gateway-Token }
+  parameters:
+    id: { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+  requestBodies:
+    Places:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [pickup_place_id, drop_place_id]
+            additionalProperties: false
+            properties:
+              pickup_place_id: { type: string, example: mg-road }
+              drop_place_id: { type: string, example: indiranagar }
+  responses:
+    Error:
+      description: Error envelope
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
   schemas:
-    StatusEnvelope:
-      type: object
-      properties:
-        data:
-          type: object
-          properties:
-            status: { type: string }
     Error:
       type: object
       properties:
@@ -43,3 +353,36 @@ components:
             code: { type: string }
             message: { type: string }
             request_id: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        phone: { type: string }
+        name: { type: string }
+        role: { type: string, enum: [passenger, driver, admin] }
+        created_at: { type: string, format: date-time }
+    SessionEnvelope:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            access_token: { type: string }
+            expires_in: { type: integer }
+            refresh_token: { type: string, description: Mobile clients only }
+            user: { $ref: "#/components/schemas/User" }
+    TripEnvelope:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            status: { type: string, enum: [requested, assigned, in_progress, completed, cancelled] }
+            pickup_place: { type: string }
+            drop_place: { type: string }
+            distance_m: { type: integer }
+            duration_s: { type: integer }
+            fare_paise: { type: integer, format: int64 }
+            boarding_code: { type: string, description: Passenger view only }
+            cab: { type: object }

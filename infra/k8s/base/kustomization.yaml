@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Stateless workloads only. Databases come from an overlay: the in-cluster
+# component (components/datastores) for dev clusters, or managed services whose
+# URLs are placed in the sarathi-secrets Secret for production.
+resources:
+  - api.yaml
+  - web-ai.yaml
+  - network.yaml
+
+configMapGenerator:
+  - name: sarathi-config
+    literals:
+      - SARATHI_ENV=production
+      - SARATHI_HTTP_ADDR=:8080
+      - SARATHI_LOG_LEVEL=info
+      - SARATHI_REQUEST_TIMEOUT=10s
+      - SARATHI_SHUTDOWN_TIMEOUT=25s
+      - SARATHI_TRUST_PROXY=true
+      - SARATHI_MONGO_DATABASE=sarathi
+      - SARATHI_REDIS_ADDR=sarathi-redis:6379
+      - SARATHI_OTP_SENDER=webhook
+      - SARATHI_PAYMENT_PROVIDER=none
+      - SARATHI_SIMULATOR=false

@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sarathi
+  annotations:
+    # Requires cert-manager with a ClusterIssuer of this name.
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+    # Coarse edge limit; the API applies finer per-user and per-phone limits in Redis.
+    nginx.ingress.kubernetes.io/limit-rps: "30"
+spec:
+  tls:
+    - hosts: [sarathi.example.com]
+      secretName: sarathi-tls
+  rules:
+    - host: sarathi.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service: { name: sarathi-api, port: { name: http } }
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: sarathi-web, port: { name: http } }

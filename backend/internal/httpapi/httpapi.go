@@ -28,6 +28,11 @@ type Options struct {
 	MaxBodyBytes   int64
 	RequestTimeout time.Duration
 	CORSOrigins    []string
+	// Advisory dependencies are reported by /readyz but never fail it: losing them
+	// degrades features (e.g. trip history) without making the API unusable.
+	Advisory []Checker
+	// API enables the product endpoints; nil serves only health and version.
+	API *API
 }
 
 type response struct {
@@ -64,25 +69,42 @@ func NewHandler(o Options) http.Handler {
 	mux.HandleFunc("GET /api/v1/version", func(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, http.StatusOK, map[string]string{"version": o.Version, "environment": o.Env})
 	})
+	if o.API != nil {
+		o.API.routes(mux)
+	}
 	// Unknown routes and wrong methods use the standard error envelope.
-	root := http.NewServeMux()
-	root.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, pattern := mux.Handler(r); pattern == "" {
+	app := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, pattern := mux.Handler(r)
+		if pattern == "" {
+			pattern = "unmatched"
 			WriteError(w, r, http.StatusNotFound, "not_found", "resource not found")
-			return
+		} else {
+			mux.ServeHTTP(w, r)
 		}
-		mux.ServeHTTP(w, r)
-	}))
+		observe(pattern, w)
+	})
 
-	return middleware.Chain(root,
+	common := []middleware.Middleware{
 		middleware.RequestID,
 		middleware.Recover(o.Log),
 		middleware.Logging(o.Log),
 		middleware.SecurityHeaders,
 		middleware.CORS(o.CORSOrigins),
+	}
+	bounded := middleware.Chain(app, append(common[:len(common):len(common)],
 		middleware.BodyLimit(o.MaxBodyBytes),
 		middleware.Deadline(o.RequestTimeout),
-	)
+	)...)
+
+	root := http.NewServeMux()
+	root.Handle("/", bounded)
+	// Prometheus scrape endpoint. Do not route it through the public ingress.
+	root.Handle("GET /metrics", metricsHandler())
+	if o.API != nil {
+		// Long-lived: no body limit or request deadline, but still logged and recovered.
+		root.Handle("GET /api/v1/ws", middleware.Chain(http.HandlerFunc(o.API.ServeWS), common[:3]...))
+	}
+	return root
 }
 
 // healthz is liveness: the process is up and serving. It checks no dependencies.
@@ -117,6 +139,20 @@ func readyz(o Options) http.HandlerFunc {
 				mu.Unlock()
 			}(c)
 		}
+		for _, c := range o.Advisory {
+			wg.Add(1)
+			go func(c Checker) {
+				defer wg.Done()
+				status := "ok"
+				if err := c.Check(ctx); err != nil {
+					status = "degraded"
+					o.Log.Warn("advisory_check_failed", slog.String("dependency", c.Name()), slog.String("error", err.Error()))
+				}
+				mu.Lock()
+				results[c.Name()] = status
+				mu.Unlock()
+			}(c)
+		}
 		wg.Wait()
 
 		names := make([]string, 0, len(results))
@@ -126,7 +162,7 @@ func readyz(o Options) http.HandlerFunc {
 		sort.Strings(names)
 		code, overall := http.StatusOK, "ready"
 		for _, n := range names {
-			if results[n] != "ok" {
+			if results[n] == "unavailable" {
 				code, overall = http.StatusServiceUnavailable, "not_ready"
 			}
 		}

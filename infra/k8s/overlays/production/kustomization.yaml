@@ -1,0 +1,47 @@
+# Production deployment. Before applying, you MUST:
+#   1. Push images and set the registry + immutable tags under `images`.
+#   2. Replace sarathi.example.com (below and in ingress-patch.yaml) with your domain.
+#   3. Create the sarathi-secrets Secret (see secret.example.yaml) from your secret
+#      manager. It is deliberately not generated here so no secret lives in git.
+#   4. Point SARATHI_OTP_WEBHOOK_URL at your SMS provider.
+#   5. Provide PostgreSQL, Redis and MongoDB. Managed services are recommended; the
+#      in-cluster component is single-replica with no backups (see its header).
+#
+#   kubectl apply -k infra/k8s/overlays/production
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sarathi
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+# Uncomment ONLY if you accept single-replica, un-backed-up in-cluster databases:
+# components:
+#   - ../../components/datastores
+
+images:
+  - { name: sarathi/api, newName: ghcr.io/your-org/sarathi-api, newTag: "1.0.0" }
+  - { name: sarathi/web, newName: ghcr.io/your-org/sarathi-web, newTag: "1.0.0" }
+  - { name: sarathi/ai, newName: ghcr.io/your-org/sarathi-ai, newTag: "1.0.0" }
+
+configMapGenerator:
+  - name: sarathi-config
+    behavior: merge
+    literals:
+      - SARATHI_ENV=production
+      - SARATHI_VERSION=1.0.0
+      - SARATHI_OTP_WEBHOOK_URL=https://sms.example.com/v1/messages
+      # Managed Redis endpoint (TLS-terminating proxies or private networking assumed).
+      - SARATHI_REDIS_ADDR=sarathi-redis:6379
+      # Comma-separated E.164 numbers that become admins on sign-in.
+      - SARATHI_ADMIN_PHONES=
+
+patches:
+  - path: ingress-patch.yaml
+  - target: { kind: Deployment, name: sarathi-api }
+    patch: |
+      - { op: replace, path: /spec/replicas, value: 3 }
+  - target: { kind: HorizontalPodAutoscaler, name: sarathi-api }
+    patch: |
+      - { op: replace, path: /spec/minReplicas, value: 3 }

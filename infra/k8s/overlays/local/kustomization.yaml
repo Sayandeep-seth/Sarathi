@@ -1,0 +1,58 @@
+# Demo deployment for a local cluster (Docker Desktop Kubernetes, kind, minikube).
+# Runs everything in-cluster with throwaway credentials and the simulated fleet.
+#
+#   docker compose build                       # builds sarathi/{api,web,ai}:local
+#   kind load docker-image sarathi/api:local sarathi/web:local sarathi/ai:local   # kind only
+#   kubectl apply -k infra/k8s/overlays/local
+#   kubectl -n sarathi port-forward svc/sarathi-web 3000:8080
+#
+# NEVER use this overlay for anything reachable from the internet: the secrets below
+# are public, OTP codes are echoed to the client and payments are mocked.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sarathi
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+components:
+  - ../../components/datastores
+
+images:
+  - { name: sarathi/api, newTag: local }
+  - { name: sarathi/web, newTag: local }
+  - { name: sarathi/ai, newTag: local }
+
+configMapGenerator:
+  - name: sarathi-config
+    behavior: merge
+    literals:
+      - SARATHI_ENV=local
+      - SARATHI_OTP_SENDER=log
+      - SARATHI_PAYMENT_PROVIDER=mock
+      - SARATHI_SIMULATOR=true
+
+secretGenerator:
+  - name: sarathi-secrets
+    literals:
+      - POSTGRES_PASSWORD=local-demo-only
+      - MONGO_PASSWORD=local-demo-only
+      - SARATHI_REDIS_PASSWORD=local-demo-only
+      - SARATHI_DATABASE_URL=postgres://sarathi:local-demo-only@sarathi-postgres:5432/sarathi?sslmode=disable
+      - SARATHI_MONGO_URL=mongodb://sarathi:local-demo-only@sarathi-mongo:27017/?authSource=admin
+      - SARATHI_JWT_SECRET=local-demo-only-jwt-secret-0123456789abcdef
+      - SARATHI_GATEWAY_TOKEN=local-demo-only-gateway-token-0123456789
+      - SARATHI_AI_SERVICE_TOKEN=local-demo-only-ai-token
+
+patches:
+  # One replica of each is plenty locally, and metrics-server may be absent.
+  - target: { kind: HorizontalPodAutoscaler, name: sarathi-api }
+    patch: |
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata: { name: sarathi-api }
+  - target: { kind: Deployment, name: sarathi-web }
+    patch: |
+      - { op: replace, path: /spec/replicas, value: 1 }
