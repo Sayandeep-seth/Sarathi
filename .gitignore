@@ -15,3 +15,23 @@ __pycache__/
 node_modules/
 coverage/
 *.log
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Redis local persistence
+redis_data/
+*.rdb
+*.aof
+
+# Python
+__pycache__/
+*.pyc
+backend/venv/
+backend/.venv/
+
+# Logs
+*.log
+logs/

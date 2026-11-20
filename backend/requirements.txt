@@ -1,0 +1,11 @@
+<CodeBlock language="txt" editable>
+fastapi
+uvicorn[standard]
+redis
+python-dotenv
+pydantic
+psycopg[binary]
+</CodeBlock>
+
+
+<text color="secondary" size="sm">

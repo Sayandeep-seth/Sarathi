@@ -1,5 +1,6 @@
 # SARATHI developer commands. Go is expected on PATH (go 1.27+).
-.PHONY: test test-go test-ai lint fmt up down docker-build migrate
+.PHONY: test test-go test-ai lint fmt up down docker-build migrate \
+	redis-up redis-down redis-logs redis-cli redis-ping redis-info
 
 test: test-go test-ai
 
@@ -30,3 +31,22 @@ down:
 
 docker-build:
 	docker compose build
+
+
+redis-up:
+	docker compose up -d redis
+
+redis-down:
+	docker compose stop redis
+
+redis-logs:
+	docker logs -f sarathi-redis
+
+redis-cli:
+	docker exec -it sarathi-redis redis-cli -a $(REDIS_PASSWORD)
+
+redis-ping:
+	docker exec sarathi-redis redis-cli -a $(REDIS_PASSWORD) ping
+
+redis-info:
+	docker exec sarathi-redis redis-cli -a $(REDIS_PASSWORD) INFO

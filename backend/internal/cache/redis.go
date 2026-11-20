@@ -1,68 +1,73 @@
-// Package cache contains a minimal Redis health probe.
-//
-// Milestone 1 only needs readiness checking, so this speaks just enough RESP
-// (AUTH + PING) over the standard library. Milestone 3+ (rate limiting, OTP
-// state) will introduce a full client library behind the same package.
+// Package cache is the Redis core of Sarathi: connection, key catalogue, TTLs,
+// generic caching, GEO, locks/slot holds, rate limiting and Lua scripts.
 package cache
 
 import (
-	"bufio"
 	"context"
+	"embed"
 	"errors"
 	"fmt"
-	"net"
-	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
-// Checker reports whether a Redis instance answers PING.
-type Checker struct {
-	Addr     string
-	Password string
+//go:embed scripts/*.lua
+var scriptFS embed.FS
+
+// Lua scripts (loaded once with SCRIPT LOAD, executed with EVALSHA).
+var (
+	ReserveSeatScript = mustScript("scripts/reserve_seat.lua")
+	ReleaseLockScript = mustScript("scripts/release_lock.lua")
+	RateLimitScript   = mustScript("scripts/rate_limit.lua")
+)
+
+func mustScript(path string) *redis.Script {
+	b, err := scriptFS.ReadFile(path)
+	if err != nil {
+		panic(fmt.Sprintf("cache: missing lua script %s: %v", path, err))
+	}
+	return redis.NewScript(string(b))
 }
 
-// Name implements httpapi.Checker.
-func (c Checker) Name() string { return "redis" }
-
-// Check dials Redis, optionally authenticates, and expects +PONG.
-func (c Checker) Check(ctx context.Context) error {
-	if c.Addr == "" {
-		return errors.New("redis address not configured")
-	}
-	d := net.Dialer{Timeout: 2 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", c.Addr)
-	if err != nil {
-		return fmt.Errorf("redis dial: %w", err)
-	}
-	defer conn.Close()
-	if dl, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(dl)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	}
-	r := bufio.NewReader(conn)
-
-	if c.Password != "" {
-		if _, err := fmt.Fprintf(conn, "*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(c.Password), c.Password); err != nil {
-			return err
-		}
-		line, err := r.ReadString('\n')
-		if err != nil {
-			return err
-		}
-		if !strings.HasPrefix(line, "+OK") {
-			return errors.New("redis auth rejected")
-		}
-	}
-	if _, err := fmt.Fprint(conn, "*1\r\n$4\r\nPING\r\n"); err != nil {
-		return err
-	}
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return err
-	}
-	if !strings.HasPrefix(line, "+PONG") {
-		return fmt.Errorf("unexpected redis reply %q", strings.TrimSpace(line))
-	}
-	return nil
+// Options mirrors config.RedisConfig without importing the app layer.
+type Options struct {
+	Addr         string
+	Password     string
+	DB           int
+	PoolSize     int
+	MinIdleConns int
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
 }
+
+// NewClient connects, pings and preloads all Lua scripts.
+func NewClient(ctx context.Context, o Options) (*redis.Client, error) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         o.Addr,
+		Password:     o.Password,
+		DB:           o.DB,
+		PoolSize:     o.PoolSize,
+		MinIdleConns: o.MinIdleConns,
+		DialTimeout:  o.DialTimeout,
+		ReadTimeout:  o.ReadTimeout,
+		WriteTimeout: o.WriteTimeout,
+	})
+	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := rdb.Ping(pctx).Err(); err != nil {
+		_ = rdb.Close()
+		return nil, fmt.Errorf("redis ping %s: %w", o.Addr, err)
+	}
+	for _, s := range []*redis.Script{ReserveSeatScript, ReleaseLockScript, RateLimitScript} {
+		if err := s.Load(pctx, rdb).Err(); err != nil {
+			_ = rdb.Close()
+			return nil, fmt.Errorf("redis script load: %w", err)
+		}
+	}
+	return rdb, nil
+}
+
+// IsNil reports whether err is a Redis "key does not exist" reply.
+func IsNil(err error) bool { return errors.Is(err, redis.Nil) }
