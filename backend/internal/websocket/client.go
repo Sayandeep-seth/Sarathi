@@ -12,15 +12,20 @@ const (
 	writeWait  = 10 * time.Second
 	pongWait   = 60 * time.Second
 	pingPeriod = 50 * time.Second
-	maxMessage = 4096
+	maxMessage = 64 * 1024
 )
 
 // Client is one connected socket.
 type Client struct {
-	hub    *Hub
-	conn   *ws.Conn
-	send   chan []byte
-	userID string
+	Hub    *Hub
+    Conn   *websocket.Conn
+    Send   chan []byte
+
+    UserID string
+    Role   string
+    RideID string
+
+    GPSService *gps.Service
 }
 
 type clientMsg struct {

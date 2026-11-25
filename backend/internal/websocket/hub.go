@@ -25,6 +25,12 @@ type Hub struct {
 	mu     sync.RWMutex
 	topics map[string]map[*Client]struct{}
 	subs   map[*Client]map[string]struct{}
+	Clients map[*Client]bool
+    Rooms   map[string]*Room
+
+    Register   chan *Client
+    Unregister chan *Client
+    Broadcast  chan []byte
 }
 
 func NewHub(rdb *redis.Client, instanceID string, log *slog.Logger) *Hub {
@@ -33,6 +39,10 @@ func NewHub(rdb *redis.Client, instanceID string, log *slog.Logger) *Hub {
 		upgrader: ws.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024, CheckOrigin: func(*http.Request) bool { return true }},
 		topics:   map[string]map[*Client]struct{}{},
 		subs:     map[*Client]map[string]struct{}{},
+		Clients:    make(map[*Client]bool),
+        Register:   make(chan *Client),
+        Unregister: make(chan *Client),
+        Broadcast:  make(chan []byte)
 	}
 }
 
@@ -59,72 +69,109 @@ func (h *Hub) Run(ctx context.Context) {
 	}
 }
 
-// ServeWS upgrades GET /ws. The user is auto-subscribed to user:<id> and driver:<id>.
-func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
-	userID := utils.UserID(r)
-	if userID == "" {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	conn, err := h.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		h.log.Debug("ws upgrade", "err", err)
-		return
-	}
-	c := &Client{hub: h, conn: conn, send: make(chan []byte, 64), userID: userID}
-	h.subscribe(c, "user:"+userID)
-	h.subscribe(c, "driver:"+userID)
-	ctx := context.WithoutCancel(r.Context())
-	h.touchPresence(ctx, userID)
-	go c.writePump()
-	go c.readPump(ctx)
+package websocket
+
+import (
+    "sync"
+)
+
+type Hub struct {
+    Clients map[*Client]bool
+    Rooms  map[string]map[*Client]bool
+
+    Register   chan *Client
+    Unregister chan *Client
+
+    mu sync.RWMutex
 }
 
-// IsOnline reports whether a user has a live socket on any pod.
-func (h *Hub) IsOnline(ctx context.Context, userID string) bool {
-	n, _ := h.rdb.Exists(ctx, cache.KeyWSPresence(userID)).Result()
-	return n == 1
+func NewHub() *Hub {
+    return Hub{
+        Clients:    make(map[*Client]bool),
+        Rooms:      make(map[string]map[*Client]bool),
+        Register:   make(chan *Client),
+        Unregister: make(chan *Client),
+    }
 }
 
-func (h *Hub) touchPresence(ctx context.Context, userID string) {
-	h.rdb.Set(ctx, cache.KeyWSPresence(userID), h.instanceID, cache.TTLWSPresence)
+func (h *Hub) Run() {
+    for {
+        select {
+        case client := <-h.Register:
+            h.mu.Lock()
+            h.Clients[client] = true
+            h.mu.Unlock()
+
+        case client := <-h.Unregister:
+            h.mu.Lock()
+
+            if _, ok := h.Clients[client]; ok {
+                delete(h.Clients, client)
+
+                for roomID, members := range h.Rooms {
+                    delete(members, client)
+
+                    if len(members) == 0 {
+                        delete(h.Rooms, roomID)
+                    }
+                }
+
+                close(client.Send)
+            }
+
+            h.mu.Unlock()
+        }
+    }
 }
 
-func (h *Hub) subscribe(c *Client, topic string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.topics[topic] == nil {
-		h.topics[topic] = map[*Client]struct{}{}
-	}
-	h.topics[topic][c] = struct{}{}
-	if h.subs[c] == nil {
-		h.subs[c] = map[string]struct{}{}
-	}
-	h.subs[c][topic] = struct{}{}
+func (h *Hub) JoinRoom(roomID string, client *Client) {
+    h.mu.Lock()
+    defer h.mu.Unlock()
+
+    if h.Rooms[roomID] == nil {
+        h.Rooms[roomID] = make(map[*Client]bool)
+    }
+
+    h.Rooms[roomID][client] = true
 }
 
-func (h *Hub) unsubscribe(c *Client, topic string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	delete(h.topics[topic], c)
-	if len(h.topics[topic]) == 0 {
-		delete(h.topics, topic)
-	}
-	delete(h.subs[c], topic)
+func (h *Hub) LeaveRoom(roomID string, client *Client) {
+    h.mu.Lock()
+    defer h.mu.Unlock()
+
+    if members, ok := h.Rooms[roomID]; ok {
+        delete(members, client)
+
+        if len(members) == 0 {
+            delete(h.Rooms, roomID)
+        }
+    }
 }
 
-func (h *Hub) remove(c *Client) {
-	h.mu.Lock()
-	for t := range h.subs[c] {
-		delete(h.topics[t], c)
-		if len(h.topics[t]) == 0 {
-			delete(h.topics, t)
-		}
-	}
-	_, existed := h.subs[c]
-	delete(h.subs, c)
-	h.mu.Unlock()
-	if existed {
-		close(c.send)
-	}
+func (h *Hub) SendToRoom(roomID string, message []byte) {
+    h.mu.RLock()
+    defer h.mu.RUnlock()
+
+    for client := range h.Rooms[roomID] {
+        select {
+        case client.Send <- message:
+        default:
+            // Client's outgoing queue is full.
+            // Its connection will be closed by the client lifecycle.
+        }
+    }
+}
+
+func (h *Hub) SendToUser(userID string, message []byte) {
+    h.mu.RLock()
+    defer h.mu.RUnlock()
+
+    for client := range h.Clients {
+        if client.UserID == userID {
+            select {
+            case client.Send <- message:
+            default:
+            }
+        }
+    }
 }

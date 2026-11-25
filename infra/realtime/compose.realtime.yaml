@@ -1,0 +1,33 @@
+# Adds the WebSocket gateway next to your existing services.
+# Run:  docker compose -f compose.yaml -f infra/realtime/compose.realtime.yaml up --build
+# Assumes your Redis service in compose.yaml is called "redis". Rename if not.
+services:
+  realtime-gateway:
+    build:
+      context: ./backend
+      dockerfile: ../infra/realtime/Dockerfile.gateway
+    environment:
+      WS_ADDR: ":8081"
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+      WS_ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:5173"
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    stop_grace_period: 15s # time for close frames to go out
+    restart: unless-stopped
+
+  # Add this healthcheck to your EXISTING redis service if it has none:
+  # redis:
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 5s
+  #     timeout: 3s
+  #     retries: 5

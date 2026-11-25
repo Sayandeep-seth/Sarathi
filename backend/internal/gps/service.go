@@ -113,3 +113,79 @@ func (s *Service) RunPersister(ctx context.Context, consumer string) error {
 	}
 	return ctx.Err()
 }
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "time"
+
+    "github.com/redis/go-redis/v9"
+)
+
+type DriverLocation struct {
+    DriverID  string    `json:"driver_id"`
+    RideID    string    `json:"ride_id"`
+    Latitude  float64   `json:"latitude"`
+    Longitude float64   `json:"longitude"`
+    Speed     float64   `json:"speed"`
+    Heading   float64   `json:"heading"`
+    Accuracy  float64   `json:"accuracy"`
+    UpdatedAt time.Time `json:"updated_at"`
+}
+
+type Service struct {
+    Redis *redis.Client
+}
+
+func NewService(redisClient *redis.Client) *Service {
+    return &Service{
+        Redis: redisClient,
+    }
+}
+
+func (s *Service) UpdateLocation(
+    ctx context.Context,
+    location DriverLocation,
+) error {
+
+    location.UpdatedAt = time.Now()
+
+    payload, err := json.Marshal(location)
+    if err != nil {
+        return err
+    }
+
+    key := fmt.Sprintf("sarathi:gps:driver:%s", location.DriverID)
+
+    // Save the driver's latest location.
+    if err := s.Redis.Set(
+        ctx,
+        key,
+        payload,
+        30*time.Second,
+    ).Err(); err != nil {
+        return err
+    }
+
+    // Publish a real-time location event.
+    event := map[string]interface{}{
+        "type": "location",
+        "event": "driver.location.update",
+        "user_id": location.DriverID,
+        "ride_id": location.RideID,
+        "timestamp": location.UpdatedAt.Unix(),
+        "data": location,
+    }
+
+    eventJSON, err := json.Marshal(event)
+    if err != nil {
+        return err
+    }
+
+    return s.Redis.Publish(
+        ctx,
+        "sarathi:ws:location",
+        eventJSON,
+    ).Err()
+}

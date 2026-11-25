@@ -1,0 +1,14 @@
+# Build context: ./backend
+FROM golang:1.24-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/realtime-gateway ./cmd/realtime-gateway
+
+FROM alpine:3.20
+RUN adduser -D -u 10001 app
+USER app
+COPY --from=build /out/realtime-gateway /usr/local/bin/realtime-gateway
+EXPOSE 8081
+ENTRYPOINT ["/usr/local/bin/realtime-gateway"]
